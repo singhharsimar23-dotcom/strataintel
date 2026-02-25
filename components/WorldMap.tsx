@@ -1,7 +1,10 @@
 
-import React, { useState, useMemo, memo } from 'react';
+import React, { useState, useMemo, useRef, useEffect, memo } from 'react';
+import { geoOrthographic, geoPath, geoGraticule, geoDistance, geoCircle } from 'd3-geo';
+import * as topojson from 'topojson-client';
+import Papa from 'papaparse';
 import { Signal, NodeStatus, Source, RawEvent, ThreatNode, SignalAnalysis } from '../types';
-import { Info, Zap, Globe, ArrowRight, Activity, Clock, Target, Shield, Skull, Radio, Lock, AlertCircle, Triangle, Crosshair, EyeOff, MapPin, ShieldCheck, History, TrendingUp } from 'lucide-react';
+import { Info, Zap, ArrowRight, Activity, Clock, Target, Shield, Skull, Radio, Lock, AlertCircle, Triangle, Crosshair, EyeOff, MapPin, ShieldCheck, History, TrendingUp } from 'lucide-react';
 import { SOURCES_REGISTRY } from '../constants';
 
 interface WorldMapProps {
@@ -13,8 +16,16 @@ interface WorldMapProps {
   onOpenHistory?: (item: Signal | ThreatNode) => void;
 }
 
-const MAP_WIDTH = 100;
-const MAP_HEIGHT = 100;
+interface CityLight {
+  lat: number;
+  lng: number;
+  latRad: number;
+  lngRad: number;
+  sinLat: number;
+  cosLat: number;
+  size: number;
+  opacity: number;
+}
 
 const PostureMarker = memo(({ status, x, y, isSelected, isHovered, onClick, onMouseEnter, onMouseLeave }: any) => {
   const getStatusColor = (s: NodeStatus) => {
@@ -42,21 +53,498 @@ const PostureMarker = memo(({ status, x, y, isSelected, isHovered, onClick, onMo
   );
 });
 
+const getSolarPosition = (date: Date) => {
+  const now = date;
+  const start = new Date(now.getFullYear(), 0, 0);
+  const diff = now.getTime() - start.getTime();
+  const oneDay = 1000 * 60 * 60 * 24;
+  const dayOfYear = Math.floor(diff / oneDay);
+  const fractionalYear = (2 * Math.PI / 365) * (dayOfYear - 1 + (now.getHours() - 12) / 24);
+  
+  const eqtime = 229.18 * (
+    0.000075 +
+    0.001868 * Math.cos(fractionalYear) -
+    0.032077 * Math.sin(fractionalYear) -
+    0.014615 * Math.cos(2 * fractionalYear) -
+    0.040849 * Math.sin(2 * fractionalYear)
+  );
+  
+  const decl = 0.006918 -
+    0.399912 * Math.cos(fractionalYear) +
+    0.070257 * Math.sin(fractionalYear) -
+    0.006758 * Math.cos(2 * fractionalYear) +
+    0.000907 * Math.sin(2 * fractionalYear) -
+    0.002697 * Math.cos(3 * fractionalYear) +
+    0.00148 * Math.sin(3 * fractionalYear);
+    
+  const lat = decl * (180 / Math.PI);
+  const timeOffset = eqtime;
+  const trueSolarTime = now.getUTCHours() * 60 + now.getUTCMinutes() + now.getUTCSeconds() / 60 + timeOffset;
+  let lng = -((trueSolarTime / 4) - 180);
+  if (lng < -180) lng += 360;
+  if (lng > 180) lng -= 360;
+  
+  return { lat, lng };
+};
+
+const CanvasGlobe = ({ width, height, signals, threatNodes, selectedItem, onSelectItem, hoveredId, setHoveredId }: any) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const markersRef = useRef<HTMLDivElement>(null);
+  const glowCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [worldData, setWorldData] = useState<any>(null);
+  const [cities, setCities] = useState<CityLight[]>([]);
+  const rotationRef = useRef<[number, number, number]>([0, 0, 0]);
+  const animationRef = useRef<number>(0);
+  
+  // Interaction Refs
+  const isDragging = useRef(false);
+  const previousMousePosition = useRef({ x: 0, y: 0 });
+  const userInteracting = useRef(false);
+  const interactionTimeout = useRef<any>(null);
+  const velocityRef = useRef({ x: 0, y: 0 });
+  const scaleRef = useRef({ current: 1, target: 1 });
+
+  useEffect(() => {
+    // Generate reusable glow particle for city lights to ensure 60fps performance
+    const glowCanvas = document.createElement('canvas');
+    glowCanvas.width = 32;
+    glowCanvas.height = 32;
+    const gCtx = glowCanvas.getContext('2d');
+    if (gCtx) {
+      const grad = gCtx.createRadialGradient(16, 16, 0, 16, 16, 16);
+      grad.addColorStop(0, 'rgba(255, 255, 255, 1)');      // White hot core
+      grad.addColorStop(0.1, 'rgba(255, 240, 150, 0.9)');  // Intense yellow
+      grad.addColorStop(0.4, 'rgba(255, 200, 100, 0.4)');  // Warm orange spread
+      grad.addColorStop(1, 'rgba(255, 200, 100, 0)');      // Fade out
+      gCtx.fillStyle = grad;
+      gCtx.fillRect(0, 0, 32, 32);
+    }
+    glowCanvasRef.current = glowCanvas;
+
+    fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json')
+      .then(res => res.json())
+      .then(data => {
+        setWorldData(topojson.feature(data, data.objects.countries));
+      });
+
+    // Fetch world cities for realistic night lights
+    fetch('https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_populated_places_simple.geojson')
+      .then(res => res.json())
+      .then(data => {
+        const parsedCities: CityLight[] = [];
+        
+        const addCity = (lat: number, lng: number, pop: number, isSuburb: boolean = false) => {
+          const latRad = lat * Math.PI / 180;
+          const lngRad = lng * Math.PI / 180;
+          
+          let size = 1.0;
+          let opacity = 0.3;
+          
+          if (pop > 15000000) { size = 12; opacity = 1.0; }
+          else if (pop > 5000000) { size = 8; opacity = 0.9; }
+          else if (pop > 1000000) { size = 5; opacity = 0.7; }
+          else if (pop > 500000) { size = 3; opacity = 0.5; }
+          else if (pop > 100000) { size = 2; opacity = 0.4; }
+          
+          if (isSuburb) {
+            size *= 0.6; // Suburbs are smaller
+            opacity *= 0.7; // Suburbs are dimmer
+          }
+
+          parsedCities.push({
+            lat, lng, latRad, lngRad,
+            sinLat: Math.sin(latRad),
+            cosLat: Math.cos(latRad),
+            size, opacity
+          });
+        };
+
+        for (const feature of data.features) {
+          const pop = feature.properties.pop_max;
+          if (pop > 10000) { // Lower threshold to include more towns
+            const lng = feature.geometry.coordinates[0];
+            const lat = feature.geometry.coordinates[1];
+            
+            // Add main city
+            addCity(lat, lng, pop);
+            
+            // Generate organic sprawl (suburbs/highways) for larger cities
+            if (pop > 100000) {
+              // Calculate number of suburbs based on population (e.g., 1M -> ~10 suburbs, 10M -> ~100)
+              const numSuburbs = Math.min(Math.floor(pop / 100000), 120); 
+              
+              for (let j = 0; j < numSuburbs; j++) {
+                // Gaussian-like distribution: more concentrated near the center
+                const u1 = Math.random();
+                const u2 = Math.random();
+                const radius = (u1 + u2) / 2 * (pop > 5000000 ? 1.5 : 0.8); // Max radius in degrees
+                const angle = Math.random() * Math.PI * 2;
+                
+                // Slightly distort the circle to make it look organic (like following coastlines/highways)
+                const sLat = lat + Math.cos(angle) * radius * 0.8; // Latitude degrees are roughly constant
+                const sLng = lng + Math.sin(angle) * radius * 1.2; // Longitude degrees shrink near poles, stretch it a bit
+                
+                // Suburbs have a fraction of the population
+                const suburbPop = pop / (5 + Math.random() * 15);
+                addCity(sLat, sLng, suburbPop, true);
+              }
+            }
+          }
+        }
+        setCities(parsedCities);
+      })
+      .catch(err => console.error("Error fetching cities:", err));
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      scaleRef.current.target += e.deltaY * -0.002;
+      scaleRef.current.target = Math.min(Math.max(0.5, scaleRef.current.target), 4);
+      userInteracting.current = true;
+      if (interactionTimeout.current) clearTimeout(interactionTimeout.current);
+      interactionTimeout.current = setTimeout(() => {
+        userInteracting.current = false;
+      }, 4000);
+    };
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', handleWheel);
+  }, []);
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    isDragging.current = true;
+    userInteracting.current = true;
+    previousMousePosition.current = { x: e.clientX, y: e.clientY };
+    velocityRef.current = { x: 0, y: 0 };
+    if (interactionTimeout.current) clearTimeout(interactionTimeout.current);
+    if (canvasRef.current) canvasRef.current.style.cursor = 'grabbing';
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!isDragging.current) return;
+    const deltaX = e.clientX - previousMousePosition.current.x;
+    const deltaY = e.clientY - previousMousePosition.current.y;
+    
+    velocityRef.current = { x: deltaX, y: deltaY };
+    rotationRef.current[0] += deltaX * 0.4;
+    rotationRef.current[1] -= deltaY * 0.4;
+    rotationRef.current[1] = Math.max(-90, Math.min(90, rotationRef.current[1]));
+
+    previousMousePosition.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handlePointerUp = () => {
+    isDragging.current = false;
+    if (canvasRef.current) canvasRef.current.style.cursor = 'grab';
+    interactionTimeout.current = setTimeout(() => {
+      userInteracting.current = false;
+    }, 4000);
+  };
+
+  const handleDoubleClick = () => {
+    scaleRef.current.target = 1;
+    userInteracting.current = false;
+    onSelectItem(null);
+  };
+
+  useEffect(() => {
+    if (!worldData || !canvasRef.current || !markersRef.current || width === 0 || height === 0) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const projection = geoOrthographic()
+      .translate([width / 2, height / 2])
+      .clipAngle(90);
+
+    const path = geoPath(projection, ctx);
+    const graticule = geoGraticule();
+
+    const render = () => {
+      ctx.clearRect(0, 0, width, height);
+
+      // Smooth Zoom Interpolation
+      scaleRef.current.current += (scaleRef.current.target - scaleRef.current.current) * 0.1;
+      projection.scale((Math.min(width, height) / 2.2) * scaleRef.current.current);
+
+      // Update rotation
+      if (isDragging.current) {
+        // Rotation is updated in pointermove
+      } else if (userInteracting.current) {
+        // Apply inertia
+        rotationRef.current[0] += velocityRef.current.x * 0.4;
+        rotationRef.current[1] -= velocityRef.current.y * 0.4;
+        rotationRef.current[1] = Math.max(-90, Math.min(90, rotationRef.current[1]));
+        velocityRef.current.x *= 0.92; // Friction
+        velocityRef.current.y *= 0.92;
+      } else if (!selectedItem) {
+        rotationRef.current[0] += 0.15; // Auto-rotate
+        rotationRef.current[1] += (0 - rotationRef.current[1]) * 0.02; // Return to equator
+      } else {
+        // Smoothly interpolate to selected item's lat/lng
+        const targetRot = [-selectedItem.lng, -selectedItem.lat, 0];
+        rotationRef.current[0] += (targetRot[0] - rotationRef.current[0]) * 0.05;
+        rotationRef.current[1] += (targetRot[1] - rotationRef.current[1]) * 0.05;
+      }
+      
+      projection.rotate(rotationRef.current);
+
+      const now = new Date();
+      const sunPos = getSolarPosition(now);
+      const antiSunPos = [sunPos.lng + 180, -sunPos.lat] as [number, number];
+
+      // Draw ocean (Daytime color)
+      ctx.beginPath();
+      path({ type: 'Sphere' });
+      ctx.fillStyle = '#0b1627'; // Brighter deep blue for day
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = 'rgba(195, 211, 51, 0.15)';
+      ctx.stroke();
+
+      // Draw graticule
+      ctx.beginPath();
+      path(graticule());
+      ctx.lineWidth = 0.5;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+      ctx.stroke();
+
+      // Draw land (Daytime color)
+      ctx.beginPath();
+      path(worldData);
+      ctx.fillStyle = 'rgba(195, 211, 51, 0.15)';
+      ctx.fill();
+      ctx.lineWidth = 0.5;
+      ctx.strokeStyle = 'rgba(195, 211, 51, 0.7)'; // Increased opacity to see borders in the dark
+      ctx.stroke();
+
+      // Draw Night Shadow (Terminator)
+      const nightCircle = geoCircle().center(antiSunPos);
+      
+      // Penumbra (soft edge gradient with atmospheric scattering)
+      for (let i = 90; i >= 72; i -= 1) {
+        ctx.beginPath();
+        path(nightCircle.radius(i)());
+        
+        let r = 2, g = 4, b = 8, a = 0.04;
+        
+        // Twilight zone (80 to 90 degrees)
+        if (i > 80) {
+          const t = (i - 80) / 10; // 0 to 1 (1 is at 90 degrees)
+          // Sunset colors: deep orange/purple fading into the night
+          r = 2 + 80 * t;  
+          g = 4 + 30 * t;  
+          b = 8 + 40 * t;  
+          a = 0.03;
+        }
+        
+        ctx.fillStyle = `rgba(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)}, ${a})`;
+        ctx.fill();
+      }
+      // Deep night core
+      ctx.beginPath();
+      path(nightCircle.radius(72)());
+      ctx.fillStyle = 'rgba(2, 4, 8, 0.65)'; // Decreased from 0.75 to allow landmass to subtly show through
+      ctx.fill();
+
+      // Draw subtle landmass borders OVER the night shadow so countries are always visible
+      ctx.beginPath();
+      path(worldData);
+      ctx.lineWidth = 0.5;
+      ctx.strokeStyle = 'rgba(195, 211, 51, 0.15)'; // Subtle green outline in the dark
+      ctx.stroke();
+
+      // Draw Sun Glow
+      const center = [-rotationRef.current[0], -rotationRef.current[1]] as [number, number];
+      const sunDistance = geoDistance(center, [sunPos.lng, sunPos.lat]);
+      if (sunDistance < Math.PI / 2) {
+        const sunCoords = projection([sunPos.lng, sunPos.lat]);
+        if (sunCoords) {
+          // Sun Corona
+          const coronaGradient = ctx.createRadialGradient(sunCoords[0], sunCoords[1], 0, sunCoords[0], sunCoords[1], width / 1.5);
+          coronaGradient.addColorStop(0, 'rgba(255, 245, 200, 0.25)');
+          coronaGradient.addColorStop(0.15, 'rgba(255, 230, 150, 0.08)');
+          coronaGradient.addColorStop(1, 'rgba(255, 230, 150, 0)');
+          ctx.beginPath();
+          ctx.arc(sunCoords[0], sunCoords[1], width / 1.5, 0, 2 * Math.PI);
+          ctx.fillStyle = coronaGradient;
+          ctx.fill();
+
+          // Sun Core
+          const coreGradient = ctx.createRadialGradient(sunCoords[0], sunCoords[1], 0, sunCoords[0], sunCoords[1], 12);
+          coreGradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+          coreGradient.addColorStop(0.4, 'rgba(255, 250, 200, 0.8)');
+          coreGradient.addColorStop(1, 'rgba(255, 250, 200, 0)');
+          ctx.beginPath();
+          ctx.arc(sunCoords[0], sunCoords[1], 12, 0, 2 * Math.PI);
+          ctx.fillStyle = coreGradient;
+          ctx.fill();
+        }
+      }
+
+      // Draw City Lights (only on the night side)
+      if (cities.length > 0 && glowCanvasRef.current) {
+        const centerLngRad = center[0] * Math.PI / 180;
+        const centerLatRad = center[1] * Math.PI / 180;
+        const centerSinLat = Math.sin(centerLatRad);
+        const centerCosLat = Math.cos(centerLatRad);
+
+        const sunLngRad = sunPos.lng * Math.PI / 180;
+        const sunLatRad = sunPos.lat * Math.PI / 180;
+        const sunSinLat = Math.sin(sunLatRad);
+        const sunCosLat = Math.cos(sunLatRad);
+
+        ctx.globalCompositeOperation = 'lighter'; // Additive blending for realistic glowing clusters
+
+        for (let i = 0; i < cities.length; i++) {
+          const city = cities[i];
+          
+          // Distance to center (visibility check: is it on the front of the globe?)
+          const cosDistCenter = centerSinLat * city.sinLat + centerCosLat * city.cosLat * Math.cos(centerLngRad - city.lngRad);
+          if (cosDistCenter > 0) { // cos(dist) > 0 means dist < PI/2
+            
+            // Distance to sun (day/night check: is it in the dark?)
+            const cosDistSun = sunSinLat * city.sinLat + sunCosLat * city.cosLat * Math.cos(sunLngRad - city.lngRad);
+            
+            if (cosDistSun < 0) { // cos(dist) < 0 means dist > PI/2 (night side)
+              const coords = projection([city.lng, city.lat]);
+              if (coords) {
+                // Fade in smoothly at the terminator
+                // cosDistSun goes from 0 (terminator) to -1 (midnight)
+                const fade = Math.min(1, -cosDistSun * 8); 
+                
+                ctx.globalAlpha = fade * city.opacity;
+                const drawSize = city.size;
+                ctx.drawImage(
+                  glowCanvasRef.current,
+                  coords[0] - drawSize / 2,
+                  coords[1] - drawSize / 2,
+                  drawSize,
+                  drawSize
+                );
+              }
+            }
+          }
+        }
+        ctx.globalCompositeOperation = 'source-over'; // Reset blend mode
+        ctx.globalAlpha = 1.0; // Reset alpha
+      }
+
+      // Draw selected item arc
+      if (selectedItem && selectedItem.analysis?.country_center) {
+        ctx.beginPath();
+        path({
+          type: 'LineString',
+          coordinates: [
+            [selectedItem.lng, selectedItem.lat],
+            [selectedItem.analysis.country_center.lng, selectedItem.analysis.country_center.lat]
+          ]
+        });
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(195, 211, 51, 0.8)';
+        ctx.setLineDash([4, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Update HTML markers positions
+      const allItems = [...threatNodes, ...signals];
+      const markerElements = markersRef.current.children;
+
+      allItems.forEach((item, index) => {
+        const el = markerElements[index] as HTMLElement;
+        if (!el) return;
+
+        const distance = geoDistance(center, [item.lng, item.lat]);
+        const isVisible = distance < Math.PI / 2;
+        
+        if (isVisible) {
+          const coords = projection([item.lng, item.lat]);
+          if (coords) {
+            el.style.display = 'block';
+            el.style.transform = `translate(${coords[0]}px, ${coords[1]}px)`;
+          }
+        } else {
+          el.style.display = 'none';
+        }
+      });
+
+      animationRef.current = requestAnimationFrame(render);
+    };
+
+    render();
+
+    return () => {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+    };
+  }, [width, height, worldData, signals, threatNodes, selectedItem, cities]);
+
+  const allItems = [...threatNodes, ...signals];
+
+  return (
+    <div className="absolute inset-0">
+      <canvas 
+        ref={canvasRef} 
+        width={width} 
+        height={height} 
+        className="absolute inset-0 cursor-grab touch-none"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerUp}
+        onDoubleClick={handleDoubleClick}
+      />
+      <div ref={markersRef} className="absolute inset-0 pointer-events-none">
+        {allItems.map((item: any) => {
+          const id = item.signal_id || item.threat_node_id;
+          const isSelected = selectedItem && ((selectedItem as any).signal_id === id || (selectedItem as any).threat_node_id === id);
+          const isHovered = hoveredId === id;
+          
+          return (
+            <div
+              key={id}
+              className="absolute top-0 left-0 pointer-events-auto"
+              style={{ display: 'none' }}
+            >
+              <PostureMarker
+                status={item.status}
+                x={0}
+                y={0}
+                isSelected={isSelected}
+                isHovered={isHovered}
+                onClick={() => onSelectItem(isSelected ? null : item)}
+                onMouseEnter={() => setHoveredId(id)}
+                onMouseLeave={() => setHoveredId(null)}
+              />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
 const WorldMap: React.FC<WorldMapProps> = ({ signals, threatNodes, rawEvents, selectedItem, onSelectItem, onOpenHistory }) => {
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const containerRef = useRef<HTMLDivElement>(null);
 
-  const project = (lat: number, lng: number) => {
-    const x = ((lng + 180) / 360) * MAP_WIDTH;
-    const y = ((90 - lat) / 180) * MAP_HEIGHT;
-    return { x, y };
-  };
-
-  const getMapTransform = () => {
-    if (!selectedItem) return { transform: 'scale(1) translate(0, 0)' };
-    const { x, y } = project(selectedItem.lat, selectedItem.lng);
-    return { transform: `scale(2.8) translate(${50 - x}%, ${50 - y}%)` };
-  };
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      for (let entry of entries) {
+        setDimensions({
+          width: entry.contentRect.width,
+          height: entry.contentRect.height
+        });
+      }
+    });
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
 
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -95,70 +583,26 @@ const WorldMap: React.FC<WorldMapProps> = ({ signals, threatNodes, rawEvents, se
   const credibilityScore = selectedItem ? calculateCredibility(selectedItem) : 0;
 
   return (
-    <div className="relative w-full h-full overflow-hidden bg-[#030508] cursor-crosshair group/map" onMouseMove={handleMouseMove}>
+    <div ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#030508] cursor-crosshair group/map" onMouseMove={handleMouseMove}>
       <div className="scanline-overlay" />
       <div className="absolute inset-0 pointer-events-none z-20">
         <div className="absolute h-full w-[1px] bg-[#c3d333]/10" style={{ left: `${mousePos.x}%` }} />
         <div className="absolute w-full h-[1px] bg-[#c3d333]/10" style={{ top: `${mousePos.y}%` }} />
       </div>
 
-      <div className="world-map-container absolute inset-0" style={getMapTransform()}>
-        <div className="map-silhouette opacity-[0.45] brightness-125 saturate-150 contrast-125" />
-        <div className="dotted-map opacity-50" />
-
-        {/* Selected Country Center Line */}
-        {selectedItem && selectedItem.analysis?.country_center && (
-          <svg className="absolute inset-0 w-full h-full pointer-events-none overflow-visible z-20">
-            {(() => {
-              const start = project(selectedItem.lat, selectedItem.lng);
-              const end = project(selectedItem.analysis.country_center.lat, selectedItem.analysis.country_center.lng);
-              return (
-                <line
-                  x1={`${start.x}%`} y1={`${start.y}%`}
-                  x2={`${end.x}%`} y2={`${end.y}%`}
-                  stroke="rgba(255,255,255,0.15)"
-                  strokeWidth="0.5"
-                  strokeDasharray="4 4"
-                  className="animate-pulse"
-                />
-              );
-            })()}
-          </svg>
+      <div className="absolute inset-0 z-10">
+        {dimensions.width > 0 && (
+          <CanvasGlobe 
+            width={dimensions.width} 
+            height={dimensions.height} 
+            signals={signals} 
+            threatNodes={threatNodes} 
+            selectedItem={selectedItem} 
+            onSelectItem={onSelectItem}
+            hoveredId={hoveredId}
+            setHoveredId={setHoveredId}
+          />
         )}
-
-        {/* Render Ongoing Threat Nodes */}
-        {threatNodes.map(tn => {
-           const { x, y } = project(tn.lat, tn.lng);
-           return (
-             <PostureMarker 
-               key={tn.threat_node_id}
-               status={tn.status}
-               x={x} y={y}
-               isSelected={isThreatNode(selectedItem) && selectedItem.threat_node_id === tn.threat_node_id}
-               isHovered={hoveredId === tn.threat_node_id}
-               onClick={() => onSelectItem(isThreatNode(selectedItem) && selectedItem.threat_node_id === tn.threat_node_id ? null : tn)}
-               onMouseEnter={() => setHoveredId(tn.threat_node_id)}
-               onMouseLeave={() => setHoveredId(null)}
-             />
-           );
-        })}
-
-        {/* Render Signals */}
-        {signals.map(sig => {
-          const { x, y } = project(sig.lat, sig.lng);
-          return (
-            <PostureMarker
-              key={sig.signal_id}
-              status={sig.status}
-              x={x} y={y}
-              isSelected={!isThreatNode(selectedItem) && selectedItem?.signal_id === sig.signal_id}
-              isHovered={hoveredId === sig.signal_id}
-              onClick={() => onSelectItem(!isThreatNode(selectedItem) && selectedItem?.signal_id === sig.signal_id ? null : sig)}
-              onMouseEnter={() => setHoveredId(sig.signal_id)}
-              onMouseLeave={() => setHoveredId(null)}
-            />
-          );
-        })}
       </div>
 
       {selectedItem && (
